@@ -6,51 +6,42 @@ Based on the [Kronos](https://github.com/shiyu-coder/Kronos) framework (AAAI 202
 
 ## Quick Start
 
-### One shot — download data, setup env, and train:
+Three scripts, run in order:
 
 ```bash
-bash setup_and_train.sh
-```
+# 1. Setup environment (clone, venv, install deps)
+bash scripts/setup_env.sh
 
-### Or step by step:
+# 2. Download & preprocess data (~200 tickers, 2004-2025)
+bash scripts/prepare_data.sh
 
-**Step 1: Download data**
-
-```bash
-bash setup_data.sh
-```
-
-**Step 2: Train (skips download since data already exists)**
-
-```bash
-cd Kronos && SKIP_DOWNLOAD=1 bash setup_and_train.sh
+# 3. Launch training
+bash scripts/launch_training.sh
 ```
 
 ### Remote server — curl and go:
 
 ```bash
-# Download & preprocess data
-curl -sL https://raw.githubusercontent.com/the-cherry-capital/Kronos/pretrain-kronos-mini/setup_data.sh | bash
-
-# Train
-cd Kronos && SKIP_DOWNLOAD=1 NUM_GPUS=4 bash setup_and_train.sh
+curl -sL https://raw.githubusercontent.com/the-cherry-capital/Kronos/pretrain-kronos-mini/scripts/setup_env.sh | bash
+cd Kronos && bash scripts/prepare_data.sh
+bash scripts/launch_training.sh
 ```
 
 ## Multi-GPU / Multi-Node
 
 ```bash
 # Single node, 4 GPUs
-NUM_GPUS=4 bash setup_and_train.sh
+NUM_GPUS=4 bash scripts/launch_training.sh
 
 # Single node, 8 GPUs, bigger batches
-NUM_GPUS=8 BATCH_SIZE=128 bash setup_and_train.sh
+NUM_GPUS=8 BATCH_SIZE=128 bash scripts/launch_training.sh
 
 # Multi-node (2 nodes x 8 GPUs) — run on each node:
 # Node 0 (master)
-NUM_GPUS=8 NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 bash setup_and_train.sh
+NUM_GPUS=8 NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 bash scripts/launch_training.sh
 
 # Node 1
-NUM_GPUS=8 NNODES=2 NODE_RANK=1 MASTER_ADDR=10.0.0.1 bash setup_and_train.sh
+NUM_GPUS=8 NNODES=2 NODE_RANK=1 MASTER_ADDR=10.0.0.1 bash scripts/launch_training.sh
 ```
 
 ## Configuration
@@ -69,8 +60,6 @@ All configurable via environment variables:
 | `PRED_EPOCHS` | `5` | Predictor training epochs |
 | `MAX_SAMPLES` | `1000000` | Cap on training samples |
 | `NUM_WORKERS` | `4` | Dataloader workers |
-| `SKIP_DOWNLOAD` | `0` | Set to `1` to skip data download |
-
 Or use `pretrain_scaled.py` directly with argparse:
 
 ```bash
@@ -82,9 +71,10 @@ torchrun --standalone --nproc_per_node=4 pretrain_scaled.py \
 
 | File | Description |
 |------|-------------|
-| `setup_and_train.sh` | One-shot: clone, venv, deps, download data, train |
-| `setup_data.sh` | One-shot: clone, venv, deps, download data only |
-| `download_data.py` | Downloads ~200 tickers daily OHLCV (2004-2025) via yfinance |
+| `scripts/setup_env.sh` | Clone repo, create venv, install deps |
+| `scripts/prepare_data.sh` | Download ~200 tickers daily OHLCV via yfinance |
+| `scripts/launch_training.sh` | Launch DDP training (single/multi-GPU/multi-node) |
+| `download_data.py` | Python data download script |
 | `pretrain_scaled.py` | Full DDP pretraining script (multi-node, multi-GPU, wandb) |
 | `pretrain_mini.py` | Minimal single-process pretraining on example CSV |
 
