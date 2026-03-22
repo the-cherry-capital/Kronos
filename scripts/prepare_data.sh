@@ -2,55 +2,39 @@
 set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════
-# Kronos Pretraining Data — One-Shot Download & Preprocess
+# 2/3 — Data Download & Preprocess
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Downloads ~200 diverse tickers (daily OHLCV, 2004-2025) via yfinance,
-# preprocesses into Kronos CSV format, and saves to data/pretrain/.
+# Downloads ~200 diverse tickers (daily OHLCV, 2004-2025) via yfinance
+# and preprocesses into Kronos CSV format.
+#
+# Prerequisite: run scripts/setup_env.sh first.
 #
 # Usage:
-#   bash setup_data.sh
+#   bash scripts/prepare_data.sh
 #
 # Env vars:
-#   INSTALL_DIR   — repo location (default: ./Kronos)
-#   REPO_URL      — git clone URL
-#   BRANCH        — branch to checkout
+#   INSTALL_DIR — repo location (default: ./Kronos)
 # ═══════════════════════════════════════════════════════════════════════
 
-REPO_URL="${REPO_URL:-https://github.com/the-cherry-capital/Kronos.git}"
-BRANCH="${BRANCH:-pretrain-kronos-mini}"
-INSTALL_DIR="${INSTALL_DIR:-$(pwd)/Kronos}"
+INSTALL_DIR="${INSTALL_DIR:-$(pwd)}"
+
+# Auto-detect: if we're inside the repo already, use cwd
+if [ ! -f "$INSTALL_DIR/download_data.py" ]; then
+    # Try parent in case scripts/ is cwd
+    INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+fi
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║    Kronos Data — Download & Preprocess                      ║"
+echo "║    [2/3] Data Download & Preprocess                          ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 
-# ── 1. Clone & checkout ──────────────────────────────────────────────
-if [ ! -d "$INSTALL_DIR/.git" ]; then
-    echo "[1/3] Cloning repo..."
-    git clone "$REPO_URL" "$INSTALL_DIR"
-else
-    echo "[1/3] Repo exists, pulling latest..."
-    git -C "$INSTALL_DIR" fetch origin
-fi
 cd "$INSTALL_DIR"
-git checkout "$BRANCH"
-git pull origin "$BRANCH" || true
-
-# ── 2. Virtual environment & deps ────────────────────────────────────
-echo "[2/3] Setting up Python environment..."
-if [ ! -d ".venv" ]; then
-    python3 -m venv .venv
-fi
 source .venv/bin/activate
-pip install --upgrade pip -q
-pip install -r requirements.txt -q
 
-# ── 3. Download & preprocess ─────────────────────────────────────────
-echo "[3/3] Downloading market data..."
+echo "Downloading ~200 tickers (daily OHLCV, 2004-2025)..."
 python3 download_data.py
 
-echo ""
 DATA_DIR="$INSTALL_DIR/data/pretrain"
 N_FILES=$(find "$DATA_DIR" -name "*.csv" | wc -l | tr -d ' ')
 TOTAL_ROWS=$(python3 -c "
@@ -62,13 +46,12 @@ else:
     print('unknown')
 ")
 
+echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "  Done!"
-echo "  Location:  $DATA_DIR"
-echo "  Tickers:   $N_FILES"
+echo "  Data ready!"
+echo "  Location:   $DATA_DIR"
+echo "  Tickers:    $N_FILES"
 echo "  Total rows: $TOTAL_ROWS"
 echo ""
-echo "  Next: run training with"
-echo "    cd $INSTALL_DIR && source .venv/bin/activate"
-echo "    SKIP_DOWNLOAD=1 bash setup_and_train.sh"
+echo "  Next: bash scripts/launch_training.sh"
 echo "════════════════════════════════════════════════════════════════"
