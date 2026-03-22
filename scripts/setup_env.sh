@@ -43,6 +43,16 @@ if [ ! -d ".venv" ]; then
 fi
 source .venv/bin/activate
 pip install --upgrade pip -q
+
+# Install PyTorch: use CUDA wheels when a GPU is detected, CPU otherwise.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo "  GPU detected — installing PyTorch with CUDA support"
+    pip install torch --index-url https://download.pytorch.org/whl/cu130 -q
+else
+    echo "  No GPU detected — installing CPU PyTorch"
+    pip install torch -q
+fi
+
 pip install -r requirements.txt -q
 
 echo ""
