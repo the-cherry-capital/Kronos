@@ -2,8 +2,8 @@
 #SBATCH -A llmservice_fm_text
 #SBATCH --qos=normal
 #SBATCH -p batch_long
-#SBATCH -N 2
-#SBATCH -t 12:00:00
+#SBATCH -N 4
+#SBATCH -t 2:00:00
 #SBATCH --mem=0
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -26,9 +26,8 @@ export NNODES="$SLURM_NNODES"
 export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | awk 'NR == 1 { print; exit }')"
 export MASTER_PORT=29500
 
-export TOK_EPOCHS=1
-export PRED_EPOCHS=1
-export BATCH_SIZE=128
+export TOK_EPOCHS=10
+export PRED_EPOCHS=10
 export MAX_SAMPLES=1000000
 export NUM_WORKERS=4
 
@@ -44,7 +43,7 @@ echo "job_name=$SLURM_JOB_NAME"
 echo "nodes=$SLURM_JOB_NODELIST"
 echo "nnodes=$SLURM_NNODES"
 echo "master=$MASTER_ADDR:$MASTER_PORT"
-echo "gpus_per_node=$NUM_GPUS batch_size=$BATCH_SIZE max_samples=$MAX_SAMPLES"
+echo "gpus_per_node=$NUM_GPUS batch_size=${BATCH_SIZE:-auto} max_samples=$MAX_SAMPLES"
 echo "tok_epochs=$TOK_EPOCHS pred_epochs=$PRED_EPOCHS num_workers=$NUM_WORKERS"
 scontrol show hostnames "$SLURM_JOB_NODELIST"
 echo "====================="

@@ -75,3 +75,8 @@ venv.bak/
 temp/
 tmp/
 .python-version
+
+# Training artifacts
+data/
+pretrained_*/
+wandb/

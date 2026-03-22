@@ -152,6 +152,7 @@ def get_config():
     # General training
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--log_interval", type=int, default=1)
+    parser.add_argument("--patience", type=int, default=3, help="Early stop after N epochs with no val improvement")
 
     # Wandb
     parser.add_argument("--wandb_project", type=str, default="kronos")
@@ -167,9 +168,9 @@ def get_config():
     if args.save_dir is None:
         args.save_dir = os.path.join(ROOT_DIR, f"pretrained_{args.model_size}_scaled")
     if args.tok_batch_size is None:
-        args.tok_batch_size = 1024 if is_large else 64
+        args.tok_batch_size = 512 if is_large else 64
     if args.pred_batch_size is None:
-        args.pred_batch_size = 1024 if is_large else 64
+        args.pred_batch_size = 512 if is_large else 64
     if args.tok_lr is None:
         args.tok_lr = 8e-4 if is_large else 2e-4
     if args.pred_lr is None:
@@ -501,6 +502,7 @@ def train_tokenizer(args, device, rank, local_rank, world_size, wandb_run):
     )
 
     best_val_loss = float('inf')
+    no_improve = 0
     save_path = os.path.join(args.save_dir, "tokenizer", "best_model")
     if is_main_process():
         os.makedirs(save_path, exist_ok=True)
@@ -599,10 +601,18 @@ def train_tokenizer(args, device, rank, local_rank, world_size, wandb_run):
 
             if avg_val < best_val_loss:
                 best_val_loss = avg_val
+                no_improve = 0
                 raw_model.save_pretrained(save_path)
                 print(f"  ** Saved best tokenizer (val={best_val_loss:.4f})")
+            else:
+                no_improve += 1
+                print(f"  ** No improvement ({no_improve}/{args.patience})")
 
         barrier()
+
+        if no_improve >= args.patience:
+            print_rank0(f"  Early stopping: no val improvement for {args.patience} epochs")
+            break
 
     if is_main_process():
         print(f"\n  Stage 1 done. Best val={best_val_loss:.4f}  Time: {fmt_time(time.time() - t0)}")
@@ -663,6 +673,7 @@ def train_predictor(args, device, rank, local_rank, world_size, wandb_run, token
     )
 
     best_val_loss = float('inf')
+    no_improve = 0
     save_path = os.path.join(args.save_dir, "predictor", "best_model")
     if is_main_process():
         os.makedirs(save_path, exist_ok=True)
@@ -789,10 +800,18 @@ def train_predictor(args, device, rank, local_rank, world_size, wandb_run, token
 
             if avg_val < best_val_loss:
                 best_val_loss = avg_val
+                no_improve = 0
                 raw_model.save_pretrained(save_path)
                 print(f"  ** Saved best predictor (val={best_val_loss:.4f})")
+            else:
+                no_improve += 1
+                print(f"  ** No improvement ({no_improve}/{args.patience})")
 
         barrier()
+
+        if no_improve >= args.patience:
+            print_rank0(f"  Early stopping: no val improvement for {args.patience} epochs")
+            break
 
     if is_main_process():
         print(f"\n  Stage 2 done. Best val={best_val_loss:.4f}  Time: {fmt_time(time.time() - t0)}")

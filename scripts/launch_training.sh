@@ -53,7 +53,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 MODEL_SIZE="${MODEL_SIZE:-large}"
 TOK_EPOCHS="${TOK_EPOCHS:-3}"
 PRED_EPOCHS="${PRED_EPOCHS:-5}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
+BATCH_SIZE="${BATCH_SIZE:-}"
 MAX_SAMPLES="${MAX_SAMPLES:-1000000}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 
@@ -102,17 +102,23 @@ TRAIN_ARGS=(
     --model_size "$MODEL_SIZE"
     --tok_epochs "$TOK_EPOCHS"
     --pred_epochs "$PRED_EPOCHS"
-    --tok_batch_size "$BATCH_SIZE"
-    --pred_batch_size "$BATCH_SIZE"
     --max_samples "$MAX_SAMPLES"
     --num_workers "$NUM_WORKERS"
     $WANDB_FLAG
 )
 
+if [ -n "$BATCH_SIZE" ]; then
+    TRAIN_ARGS+=(--tok_batch_size "$BATCH_SIZE" --pred_batch_size "$BATCH_SIZE")
+fi
+
 if [ "$NUM_GPUS" -gt 1 ] || [ "$NNODES" -gt 1 ]; then
     TOTAL_PROCS=$((NUM_GPUS > 0 ? NUM_GPUS : 1))
     echo "  Mode:       Distributed (${NNODES} nodes x ${TOTAL_PROCS} GPUs)"
-    echo "  Batch:      ${BATCH_SIZE}/GPU x ${TOTAL_PROCS} GPUs x ${NNODES} nodes = $((BATCH_SIZE * TOTAL_PROCS * NNODES)) effective"
+    if [ -n "$BATCH_SIZE" ]; then
+        echo "  Batch:      ${BATCH_SIZE}/GPU x ${TOTAL_PROCS} GPUs x ${NNODES} nodes = $((BATCH_SIZE * TOTAL_PROCS * NNODES)) effective"
+    else
+        echo "  Batch:      (auto per model_size)"
+    fi
     echo "  Tok epochs: $TOK_EPOCHS"
     echo "  Pred epochs: $PRED_EPOCHS"
     echo ""
@@ -126,7 +132,7 @@ if [ "$NUM_GPUS" -gt 1 ] || [ "$NNODES" -gt 1 ]; then
         pretrain_scaled.py "${TRAIN_ARGS[@]}"
 else
     echo "  Mode:       Single process"
-    echo "  Batch:      $BATCH_SIZE"
+    echo "  Batch:      ${BATCH_SIZE:-(auto)}"
     echo "  Tok epochs: $TOK_EPOCHS"
     echo "  Pred epochs: $PRED_EPOCHS"
     echo ""
