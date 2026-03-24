@@ -80,3 +80,4 @@ tmp/
 data/
 pretrained_*/
 wandb/
+.yfinance_cache/

@@ -5,8 +5,8 @@ set -euo pipefail
 # 2/3 — Data Download & Preprocess
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Downloads ~200 diverse tickers (daily OHLCV, 2004-2025) via yfinance
-# and preprocesses into Kronos CSV format.
+# Downloads hourly Yahoo Finance data for a curated set of popular tickers
+# and preprocesses it into Kronos CSV format.
 #
 # Prerequisite: run scripts/setup_env.sh first.
 #
@@ -14,7 +14,12 @@ set -euo pipefail
 #   bash scripts/prepare_data.sh
 #
 # Env vars:
-#   INSTALL_DIR — repo location (default: ./Kronos)
+#   INSTALL_DIR          — repo location (default: ./Kronos)
+#   PRETRAIN_TICKERS            — optional comma-separated ticker override
+#   PRETRAIN_FREQUENCY          — bar size (default: 60m)
+#   PRETRAIN_LOOKBACK           — provider lookback window (default: 730d)
+#   PRETRAIN_TOTAL_ROWS         — target total rows across all tickers (default: 100000)
+#   PRETRAIN_MIN_ROWS_PER_TICKER — minimum usable rows per ticker (default: 1000)
 # ═══════════════════════════════════════════════════════════════════════
 
 INSTALL_DIR="${INSTALL_DIR:-$(pwd)}"
@@ -32,7 +37,13 @@ echo "╚═══════════════════════�
 cd "$INSTALL_DIR"
 source .venv/bin/activate
 
-echo "Downloading ~200 tickers (daily OHLCV, 2004-2025)..."
+echo "Downloading hourly data from popular tickers..."
+echo "  Frequency:   ${PRETRAIN_FREQUENCY:-60m}"
+echo "  Lookback:    ${PRETRAIN_LOOKBACK:-730d}"
+echo "  Target rows: ${PRETRAIN_TOTAL_ROWS:-100000}"
+if [ -n "${PRETRAIN_TICKERS:-}" ]; then
+    echo "  Tickers:     ${PRETRAIN_TICKERS}"
+fi
 python3 download_data.py
 
 DATA_DIR="$INSTALL_DIR/data/pretrain"

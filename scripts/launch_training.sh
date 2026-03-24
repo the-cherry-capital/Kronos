@@ -28,10 +28,13 @@ set -euo pipefail
 #   MASTER_ADDR   — master node address (default: 127.0.0.1)
 #   MASTER_PORT   — master node port (default: 29500)
 #   BATCH_SIZE    — per-GPU batch size (default: 64)
+#   SEQ_LEN       — autoregressive context length (default: 144)
+#   TRAIN_RATIO   — train split fraction (default: pretrain_scaled.py default)
 #   TOK_EPOCHS    — tokenizer epochs (default: 3)
 #   PRED_EPOCHS   — predictor epochs (default: 5)
 #   MAX_SAMPLES   — cap training samples (default: 1000000)
 #   NUM_WORKERS   — dataloader workers (default: 4)
+#   DATA_DIR      — training dataset directory (default: ./data/pretrain)
 #   INSTALL_DIR   — repo location (default: ./Kronos)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -54,8 +57,11 @@ MODEL_SIZE="${MODEL_SIZE:-large}"
 TOK_EPOCHS="${TOK_EPOCHS:-3}"
 PRED_EPOCHS="${PRED_EPOCHS:-5}"
 BATCH_SIZE="${BATCH_SIZE:-}"
+SEQ_LEN="${SEQ_LEN:-}"
+TRAIN_RATIO="${TRAIN_RATIO:-}"
 MAX_SAMPLES="${MAX_SAMPLES:-1000000}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+DATA_DIR="${DATA_DIR:-$INSTALL_DIR/data/pretrain}"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║    [3/3] Launch Training                                     ║"
@@ -73,6 +79,7 @@ export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
 echo "  Host:         $(hostname)"
 echo "  Install dir:  $INSTALL_DIR"
+echo "  Data dir:     $DATA_DIR"
 echo "  Node rank:    $NODE_RANK / $NNODES"
 echo "  Master:       $MASTER_ADDR:$MASTER_PORT"
 echo "  NUM_GPUS:     $NUM_GPUS"
@@ -89,6 +96,13 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader
 fi
 
+if [ -n "$SEQ_LEN" ]; then
+    echo "  Seq len:     $SEQ_LEN"
+fi
+if [ -n "$TRAIN_RATIO" ]; then
+    echo "  Train ratio: $TRAIN_RATIO"
+fi
+
 # Wandb check
 if python3 -c "import wandb; assert wandb.api.api_key" 2>/dev/null; then
     echo "  wandb: logged in"
@@ -100,6 +114,7 @@ fi
 
 TRAIN_ARGS=(
     --model_size "$MODEL_SIZE"
+    --data_dir "$DATA_DIR"
     --tok_epochs "$TOK_EPOCHS"
     --pred_epochs "$PRED_EPOCHS"
     --max_samples "$MAX_SAMPLES"
@@ -109,6 +124,14 @@ TRAIN_ARGS=(
 
 if [ -n "$BATCH_SIZE" ]; then
     TRAIN_ARGS+=(--tok_batch_size "$BATCH_SIZE" --pred_batch_size "$BATCH_SIZE")
+fi
+
+if [ -n "$SEQ_LEN" ]; then
+    TRAIN_ARGS+=(--seq_len "$SEQ_LEN")
+fi
+
+if [ -n "$TRAIN_RATIO" ]; then
+    TRAIN_ARGS+=(--train_ratio "$TRAIN_RATIO")
 fi
 
 if [ "$NUM_GPUS" -gt 1 ] || [ "$NNODES" -gt 1 ]; then
@@ -142,5 +165,5 @@ fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo "  Done! Checkpoints: $INSTALL_DIR/pretrained_mini_scaled/"
+echo "  Done! See 'Run dir', 'Tok cache', and final summary above."
 echo "════════════════════════════════════════════════════════════════"

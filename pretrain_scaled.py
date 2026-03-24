@@ -29,6 +29,7 @@ import glob
 import time
 import random
 import datetime
+import hashlib
 import json
 import argparse
 import socket
@@ -52,6 +53,15 @@ sys.path.insert(0, ROOT_DIR)
 
 from model.kronos import KronosTokenizer, Kronos
 
+VAL_MAX_SAMPLES = 50_000
+CHECKPOINT_WEIGHT_FILES = (
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+)
+_DATASET_CACHE = {}
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Distributed Helpers
@@ -73,7 +83,10 @@ def setup_distributed():
             backend = "gloo"
             device = torch.device("cpu")
 
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        init_kwargs = dict(backend=backend, rank=rank, world_size=world_size)
+        if backend == "nccl":
+            init_kwargs["device_id"] = device
+        dist.init_process_group(**init_kwargs)
     else:
         # Single process — auto-detect best device
         if torch.cuda.is_available():
@@ -86,8 +99,14 @@ def setup_distributed():
     return rank, world_size, local_rank, device
 
 
-def cleanup_distributed():
+def cleanup_distributed(device=None):
     if dist.is_initialized():
+        if device is not None and device.type == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(get_cuda_device_index(device))
+            except Exception:
+                pass
+        barrier(device)
         dist.destroy_process_group()
 
 
@@ -95,9 +114,12 @@ def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def barrier():
+def barrier(device=None):
     if dist.is_initialized():
-        dist.barrier()
+        if device is not None and device.type == "cuda" and torch.cuda.is_available():
+            dist.barrier(device_ids=[get_cuda_device_index(device)])
+        else:
+            dist.barrier()
 
 
 def all_reduce_scalar(value, device):
@@ -107,6 +129,15 @@ def all_reduce_scalar(value, device):
     t = torch.tensor([value], dtype=torch.float32, device=device)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t.item()
+
+
+def broadcast_flag(flag, device, src=0):
+    """Broadcast a boolean flag from src rank to all ranks."""
+    if not dist.is_initialized():
+        return flag
+    t = torch.tensor([int(flag)], dtype=torch.int32, device=device)
+    dist.broadcast(t, src=src)
+    return bool(t.item())
 
 
 def print_rank0(msg):
@@ -130,8 +161,10 @@ def get_config():
     parser.add_argument("--seed", type=int, default=42)
 
     # Data
-    parser.add_argument("--lookback", type=int, default=128)
-    parser.add_argument("--predict", type=int, default=16)
+    parser.add_argument(
+        "--seq_len", type=int, default=144,
+        help="Autoregressive context length in tokens"
+    )
     parser.add_argument("--clip", type=float, default=5.0)
     parser.add_argument("--train_ratio", type=float, default=0.85)
     parser.add_argument("--max_samples", type=int, default=1_000_000)
@@ -161,7 +194,8 @@ def get_config():
     parser.add_argument("--no_wandb", action="store_true")
 
     args = parser.parse_args()
-    args.window = args.lookback + args.predict + 1
+
+    args.window = args.seq_len + 1
 
     # Resolve model-size-dependent defaults
     is_large = args.model_size == "large"
@@ -177,6 +211,44 @@ def get_config():
         args.pred_lr = 1.6e-3 if is_large else 4e-4
 
     args.tok_arch, args.pred_arch = MODEL_CONFIGS[args.model_size]
+    args.save_root_dir = args.save_dir
+    args.launch_id = resolve_launch_id()
+    args.dataset_metadata = resolve_dataset_metadata(args.data_dir)
+    args.dataset_signature = args.dataset_metadata["signature"]
+
+    tokenizer_config = build_tokenizer_config(args)
+    run_config = build_run_config(args)
+    args.tokenizer_config_name = build_config_name(
+        "tok",
+        [
+            ("m", args.model_size),
+            ("sl", args.seq_len),
+            ("tr", args.train_ratio),
+            ("tb", args.tok_batch_size),
+            ("te", args.tok_epochs),
+            ("ms", args.max_samples),
+            ("ds", args.dataset_signature),
+        ],
+        tokenizer_config,
+    )
+    args.run_config_name = build_config_name(
+        "run",
+        [
+            ("m", args.model_size),
+            ("sl", args.seq_len),
+            ("tr", args.train_ratio),
+            ("tb", args.tok_batch_size),
+            ("pb", args.pred_batch_size),
+            ("ms", args.max_samples),
+            ("ds", args.dataset_signature),
+        ],
+        run_config,
+        launch_id=args.launch_id,
+    )
+    args.tokenizer_dir = os.path.join(args.save_root_dir, "tokenizers", args.tokenizer_config_name)
+    args.tokenizer_checkpoint_path = os.path.join(args.tokenizer_dir, "best_model")
+    args.save_dir = os.path.join(args.save_root_dir, "runs", args.run_config_name)
+    args.predictor_checkpoint_path = os.path.join(args.save_dir, "predictor", "best_model")
     return args
 
 
@@ -250,6 +322,104 @@ def fmt(n):
 
 def fmt_time(s):
     return str(datetime.timedelta(seconds=int(s)))
+
+
+def format_config_value(value):
+    if isinstance(value, float):
+        text = f"{value:g}"
+    else:
+        text = str(value)
+    text = text.replace(os.sep, "-").replace(" ", "")
+    return text.replace(".", "p")
+
+
+def short_config_hash(config):
+    payload = json.dumps(config, sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
+
+
+def build_config_name(prefix, readable_items, full_config, launch_id=None):
+    parts = [prefix]
+    parts.extend(f"{key}-{format_config_value(value)}" for key, value in readable_items)
+    parts.append(short_config_hash(full_config))
+    if launch_id is not None:
+        parts.append(format_config_value(launch_id))
+    return "__".join(parts)
+
+
+def resolve_launch_id():
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    if slurm_job_id:
+        return f"slurm{slurm_job_id}"
+    return datetime.datetime.now().strftime("run%Y%m%d_%H%M%S_%f")
+
+
+def resolve_dataset_metadata(data_dir):
+    data_dir = os.path.abspath(data_dir)
+    manifest_path = os.path.join(data_dir, "manifest.json")
+    payload = {"data_dir": data_dir}
+    summary = {"data_dir": data_dir, "has_manifest": False}
+
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        payload["manifest"] = manifest
+        summary["has_manifest"] = True
+        summary["source_name"] = manifest.get("source_name")
+        summary["frequency"] = manifest.get("frequency")
+        summary["total_rows"] = manifest.get("total_rows")
+        summary["total_tickers"] = manifest.get("total_tickers")
+        summary["selected_tickers"] = manifest.get("selected_tickers", [])
+    else:
+        csv_files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
+        payload["csv_files"] = [
+            {"name": os.path.basename(path), "size": os.path.getsize(path)}
+            for path in csv_files
+        ]
+        summary["total_tickers"] = len(csv_files)
+
+    summary["signature"] = short_config_hash(payload)
+    return summary
+
+
+def build_tokenizer_config(args):
+    return {
+        "model_size": args.model_size,
+        "data_dir": os.path.abspath(args.data_dir),
+        "dataset_signature": args.dataset_signature,
+        "seq_len": args.seq_len,
+        "clip": args.clip,
+        "train_ratio": args.train_ratio,
+        "max_samples": args.max_samples,
+        "seed": args.seed,
+        "tok_epochs": args.tok_epochs,
+        "tok_batch_size": args.tok_batch_size,
+        "tok_lr": args.tok_lr,
+        "tok_grad_accum": args.tok_grad_accum,
+        "weight_decay": args.weight_decay,
+        "patience": args.patience,
+        "tok_arch": args.tok_arch,
+    }
+
+
+def build_run_config(args):
+    config = build_tokenizer_config(args)
+    config.update({
+        "pred_epochs": args.pred_epochs,
+        "pred_batch_size": args.pred_batch_size,
+        "pred_lr": args.pred_lr,
+        "pred_grad_accum": args.pred_grad_accum,
+        "pred_arch": args.pred_arch,
+    })
+    return config
+
+
+def pretrained_checkpoint_exists(path):
+    if not os.path.isdir(path):
+        return False
+    has_config = os.path.isfile(os.path.join(path, "config.json"))
+    has_weights = any(os.path.isfile(os.path.join(path, name)) for name in CHECKPOINT_WEIGHT_FILES)
+    return has_config and has_weights
 
 
 def fmt_bytes(n):
@@ -424,14 +594,68 @@ class MultiStockKlineDataset(Dataset):
 # Dataloader Factory
 # ═══════════════════════════════════════════════════════════════════════
 
-def make_loaders(args, rank, world_size):
+def get_datasets(args):
+    """Load datasets once per process so stage 2 does not rescan the data dir."""
+    train_key = ("train", args.data_dir, args.window, args.clip,
+                 args.train_ratio, args.max_samples, args.seed)
+    val_key = ("val", args.data_dir, args.window, args.clip,
+               args.train_ratio, VAL_MAX_SAMPLES, args.seed + 1)
+
+    if train_key not in _DATASET_CACHE:
+        _DATASET_CACHE[train_key] = MultiStockKlineDataset(
+            args.data_dir, 'train', args.window, args.clip,
+            args.train_ratio, args.max_samples, args.seed)
+    if val_key not in _DATASET_CACHE:
+        _DATASET_CACHE[val_key] = MultiStockKlineDataset(
+            args.data_dir, 'val', args.window, args.clip,
+            args.train_ratio, max_samples=VAL_MAX_SAMPLES, seed=args.seed + 1)
+
+    return _DATASET_CACHE[train_key], _DATASET_CACHE[val_key]
+
+
+def compute_steps_per_epoch(stage_name, data_dir, train_ds, train_loader, train_sampler, batch_size, grad_accum):
+    local_train_samples = len(train_sampler) if train_sampler is not None else len(train_ds)
+
+    if len(train_ds) == 0:
+        raise ValueError(
+            f"{stage_name}: found 0 training samples in {data_dir}. "
+            "Check that the CSV files still exist and remain available for both training stages."
+        )
+    if len(train_loader) == 0:
+        raise ValueError(
+            f"{stage_name}: train loader is empty (data_dir={data_dir}, "
+            f"train_samples={len(train_ds):,}, local_samples_per_rank={local_train_samples:,}, "
+            f"batch_size={batch_size}, grad_accum={grad_accum}). "
+            "Reduce the per-rank batch size or restore the training data."
+        )
+
+    steps_per_epoch = len(train_loader) // grad_accum
+    if steps_per_epoch <= 0:
+        raise ValueError(
+            f"{stage_name}: steps_per_epoch would be 0 "
+            f"(batches_per_epoch={len(train_loader)}, grad_accum={grad_accum}). "
+            "Reduce gradient accumulation or batch size."
+        )
+
+    return steps_per_epoch
+
+
+def make_loaders(args, rank, world_size, batch_size=None):
     """Create train/val datasets and distributed dataloaders."""
-    train_ds = MultiStockKlineDataset(
-        args.data_dir, 'train', args.window, args.clip,
-        args.train_ratio, args.max_samples, args.seed)
-    val_ds = MultiStockKlineDataset(
-        args.data_dir, 'val', args.window, args.clip,
-        args.train_ratio, max_samples=50_000, seed=args.seed + 1)
+    train_ds, val_ds = get_datasets(args)
+    batch_size = args.tok_batch_size if batch_size is None else batch_size
+    if batch_size is None or batch_size <= 0:
+        raise ValueError(f"Expected a positive batch size, got {batch_size}")
+
+    if len(val_ds) == 0:
+        val_fraction = max(1.0 - args.train_ratio, 1e-12)
+        approx_min_rows = int(np.ceil(args.window / val_fraction))
+        raise ValueError(
+            f"Found 0 validation samples in {args.data_dir} for seq_len={args.seq_len} "
+            f"(sample_window={args.window}, train_ratio={args.train_ratio}). "
+            f"Each CSV needs roughly {approx_min_rows:,}+ total rows to contribute at least "
+            "one validation window. Reduce --seq_len, reduce --train_ratio, or use longer series."
+        )
 
     use_ddp = dist.is_initialized()
 
@@ -443,22 +667,35 @@ def make_loaders(args, rank, world_size):
         val_ds, num_replicas=world_size, rank=rank, shuffle=False
     ) if use_ddp else None
 
+    local_train_samples = len(train_sampler) if train_sampler is not None else len(train_ds)
+    train_drop_last = local_train_samples >= batch_size
+    if local_train_samples > 0 and not train_drop_last and is_main_process():
+        print(f"  Warning: only {local_train_samples:,} train samples per rank for "
+              f"batch_size={batch_size}; using drop_last=False")
+
     train_loader = DataLoader(
-        train_ds, batch_size=args.tok_batch_size,
+        train_ds, batch_size=batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=True,
+        drop_last=train_drop_last,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=args.tok_batch_size,
+        val_ds, batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
+    if len(val_loader) == 0:
+        local_val_samples = len(val_sampler) if val_sampler is not None else len(val_ds)
+        raise ValueError(
+            f"Validation loader is empty (val_samples={len(val_ds):,}, "
+            f"local_samples_per_rank={local_val_samples:,}, batch_size={batch_size}). "
+            "Reduce the number of ranks, reduce --seq_len, or use more validation data."
+        )
     return train_loader, val_loader, train_ds, val_ds, train_sampler, val_sampler
 
 
@@ -484,10 +721,15 @@ def train_tokenizer(args, device, rank, local_rank, world_size, wandb_run):
 
     # Data
     print_rank0("  Loading data...")
-    train_loader, val_loader, train_ds, _, train_sampler, _ = make_loaders(args, rank, world_size)
+    train_loader, val_loader, train_ds, _, train_sampler, _ = make_loaders(
+        args, rank, world_size, batch_size=args.tok_batch_size
+    )
 
     effective_bs = args.tok_batch_size * world_size * args.tok_grad_accum
-    steps_per_epoch = len(train_loader) // args.tok_grad_accum
+    steps_per_epoch = compute_steps_per_epoch(
+        "Tokenizer stage", args.data_dir, train_ds, train_loader,
+        train_sampler, args.tok_batch_size, args.tok_grad_accum,
+    )
     total_steps = steps_per_epoch * args.tok_epochs
     print_rank0(f"  Per-GPU batch: {args.tok_batch_size}, World: {world_size}, "
                 f"Grad accum: {args.tok_grad_accum}, Effective batch: {effective_bs}")
@@ -503,10 +745,10 @@ def train_tokenizer(args, device, rank, local_rank, world_size, wandb_run):
 
     best_val_loss = float('inf')
     no_improve = 0
-    save_path = os.path.join(args.save_dir, "tokenizer", "best_model")
+    save_path = args.tokenizer_checkpoint_path
     if is_main_process():
         os.makedirs(save_path, exist_ok=True)
-    barrier()
+    barrier(device)
 
     global_step = 0
     t0 = time.time()
@@ -578,8 +820,16 @@ def train_tokenizer(args, device, rank, local_rank, world_size, wandb_run):
 
         val_loss_sum = all_reduce_scalar(val_loss_sum, device)
         val_count = all_reduce_scalar(val_count, device)
-        avg_val = val_loss_sum / val_count if val_count > 0 else 0
+        if val_count <= 0:
+            raise RuntimeError("Tokenizer validation produced 0 samples after reduction.")
+        avg_val = val_loss_sum / val_count
 
+        epoch_loss = all_reduce_scalar(epoch_loss, device)
+        epoch_recon = all_reduce_scalar(epoch_recon, device)
+        epoch_bsq = all_reduce_scalar(epoch_bsq, device)
+        epoch_steps = all_reduce_scalar(epoch_steps, device)
+
+        stop_now = False
         if is_main_process():
             avg_train = epoch_loss / epoch_steps
             pct = global_step / total_steps * 100
@@ -607,10 +857,12 @@ def train_tokenizer(args, device, rank, local_rank, world_size, wandb_run):
             else:
                 no_improve += 1
                 print(f"  ** No improvement ({no_improve}/{args.patience})")
+            stop_now = no_improve >= args.patience
 
-        barrier()
+        stop_now = broadcast_flag(stop_now, device)
+        barrier(device)
 
-        if no_improve >= args.patience:
+        if stop_now:
             print_rank0(f"  Early stopping: no val improvement for {args.patience} epochs")
             break
 
@@ -650,13 +902,15 @@ def train_predictor(args, device, rank, local_rank, world_size, wandb_run, token
     # Data
     print_rank0("  Loading data...")
 
-    # Re-create loaders with predictor batch size
-    args_copy = argparse.Namespace(**vars(args))
-    args_copy.tok_batch_size = args.pred_batch_size  # reuse loader factory
-    train_loader, val_loader, train_ds, _, train_sampler, _ = make_loaders(args_copy, rank, world_size)
+    train_loader, val_loader, train_ds, _, train_sampler, _ = make_loaders(
+        args, rank, world_size, batch_size=args.pred_batch_size
+    )
 
     effective_bs = args.pred_batch_size * world_size * args.pred_grad_accum
-    steps_per_epoch = len(train_loader) // args.pred_grad_accum
+    steps_per_epoch = compute_steps_per_epoch(
+        "Predictor stage", args.data_dir, train_ds, train_loader,
+        train_sampler, args.pred_batch_size, args.pred_grad_accum,
+    )
     total_steps = steps_per_epoch * args.pred_epochs
     print_rank0(f"  Per-GPU batch: {args.pred_batch_size}, World: {world_size}, "
                 f"Grad accum: {args.pred_grad_accum}, Effective batch: {effective_bs}")
@@ -674,10 +928,10 @@ def train_predictor(args, device, rank, local_rank, world_size, wandb_run, token
 
     best_val_loss = float('inf')
     no_improve = 0
-    save_path = os.path.join(args.save_dir, "predictor", "best_model")
+    save_path = args.predictor_checkpoint_path
     if is_main_process():
         os.makedirs(save_path, exist_ok=True)
-    barrier()
+    barrier(device)
 
     global_step = 0
     t0 = time.time()
@@ -762,6 +1016,7 @@ def train_predictor(args, device, rank, local_rank, world_size, wandb_run, token
 
                 s1_logits, s2_logits = (raw_model if not dist.is_initialized() else model)(
                     s1_in, s2_in, stamp_in,
+                    use_teacher_forcing=True, s1_targets=s1_tgt,
                 )
                 v_loss, v_s1, v_s2 = raw_model.head.compute_loss(
                     s1_logits, s2_logits, s1_tgt, s2_tgt
@@ -776,8 +1031,16 @@ def train_predictor(args, device, rank, local_rank, world_size, wandb_run, token
         vs1_sum = all_reduce_scalar(vs1_sum, device)
         vs2_sum = all_reduce_scalar(vs2_sum, device)
         v_count = all_reduce_scalar(v_count, device)
-        avg_val = vl_sum / v_count if v_count > 0 else 0
+        if v_count <= 0:
+            raise RuntimeError("Predictor validation produced 0 samples after reduction.")
+        avg_val = vl_sum / v_count
 
+        ep_loss = all_reduce_scalar(ep_loss, device)
+        ep_s1 = all_reduce_scalar(ep_s1, device)
+        ep_s2 = all_reduce_scalar(ep_s2, device)
+        ep_steps = all_reduce_scalar(ep_steps, device)
+
+        stop_now = False
         if is_main_process():
             avg_train = ep_loss / ep_steps
             pct = global_step / total_steps * 100
@@ -806,10 +1069,12 @@ def train_predictor(args, device, rank, local_rank, world_size, wandb_run, token
             else:
                 no_improve += 1
                 print(f"  ** No improvement ({no_improve}/{args.patience})")
+            stop_now = no_improve >= args.patience
 
-        barrier()
+        stop_now = broadcast_flag(stop_now, device)
+        barrier(device)
 
-        if no_improve >= args.patience:
+        if stop_now:
             print_rank0(f"  Early stopping: no val improvement for {args.patience} epochs")
             break
 
@@ -827,6 +1092,7 @@ def main():
     args = get_config()
     rank, world_size, local_rank, device = setup_distributed()
     set_seed(args.seed, rank)
+    tokenizer_exists = pretrained_checkpoint_exists(args.tokenizer_checkpoint_path)
 
     print_rank0("╔══════════════════════════════════════════════════════════════╗")
     print_rank0(f"║    Kronos-{args.model_size} Distributed Pretraining" + " " * max(0, 38 - len(args.model_size)) + "║")
@@ -840,12 +1106,25 @@ def main():
         print_rank0(f"  GPU:        {props.name}  VRAM: {fmt_bytes(props.total_memory)}  CUDA: {torch.version.cuda}")
         print_rank0(f"  GPU memory: {format_gpu_memory(device)}")
     print_rank0(f"  Data:       {args.data_dir}")
-    print_rank0(f"  Save to:    {args.save_dir}")
+    print_rank0(f"  Data sig:   {args.dataset_signature}")
+    if args.dataset_metadata.get("has_manifest"):
+        source_name = args.dataset_metadata.get("source_name", "unknown")
+        frequency = args.dataset_metadata.get("frequency", "unknown")
+        total_tickers = args.dataset_metadata.get("total_tickers", "unknown")
+        total_rows = args.dataset_metadata.get("total_rows", "unknown")
+        print_rank0(f"  Dataset:    {source_name}  freq={frequency}  "
+                    f"tickers={total_tickers}  rows={total_rows}")
+    print_rank0(f"  Seq len:    {args.seq_len} (sample window={args.window})")
+    print_rank0(f"  Save root:  {args.save_root_dir}")
+    print_rank0(f"  Run dir:    {args.save_dir}")
+    print_rank0(f"  Tok cache:  {args.tokenizer_checkpoint_path}")
+    print_rank0(f"  Pred save:  {args.predictor_checkpoint_path}")
     print_rank0(f"  Max samples: {args.max_samples:,}")
 
     if is_main_process():
         os.makedirs(args.save_dir, exist_ok=True)
-    barrier()
+        os.makedirs(os.path.dirname(args.tokenizer_checkpoint_path), exist_ok=True)
+    barrier(device)
 
     # Wandb (rank 0 only)
     wandb_run = None
@@ -855,8 +1134,16 @@ def main():
             "model_size": args.model_size,
             "tokenizer_arch": args.tok_arch,
             "predictor_arch": args.pred_arch,
+            "dataset_metadata": args.dataset_metadata,
             "training": vars(args),
             "world_size": world_size,
+            "paths": {
+                "save_root_dir": args.save_root_dir,
+                "run_dir": args.save_dir,
+                "tokenizer_checkpoint": args.tokenizer_checkpoint_path,
+                "predictor_checkpoint": args.predictor_checkpoint_path,
+            },
+            "tokenizer_reused": tokenizer_exists,
         }
         wandb_run = wandb.init(
             project=args.wandb_project, entity=args.wandb_entity,
@@ -868,12 +1155,23 @@ def main():
             json.dump(config_dict, f, indent=2, default=str)
 
     # ── Stage 1 ───────────────────────────────────────────────────────
-    tok_path, tok_steps = train_tokenizer(args, device, rank, local_rank, world_size, wandb_run)
+    if tokenizer_exists:
+        tok_path = args.tokenizer_checkpoint_path
+        tok_steps = 0
+        print_rank0("\n" + "=" * 64)
+        print_rank0("  STAGE 1: Tokenizer Reuse")
+        print_rank0("=" * 64)
+        print_rank0(f"  Found existing tokenizer checkpoint: {tok_path}")
+        print_rank0("  Skipping tokenizer pretraining for this launch.")
+    else:
+        tok_path, tok_steps = train_tokenizer(args, device, rank, local_rank, world_size, wandb_run)
 
     # ── Stage 2 ───────────────────────────────────────────────────────
     pred_path = train_predictor(args, device, rank, local_rank, world_size, wandb_run, tok_path, tok_steps)
 
     # ── Done ──────────────────────────────────────────────────────────
+    barrier(device)
+
     if wandb_run:
         wandb_run.finish()
 
@@ -884,7 +1182,8 @@ def main():
     print_rank0(f"  Predictor: {pred_path}")
     print_rank0("=" * 64)
 
-    cleanup_distributed()
+    barrier(device)
+    cleanup_distributed(device)
 
 
 if __name__ == "__main__":

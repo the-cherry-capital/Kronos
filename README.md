@@ -12,7 +12,7 @@ Three scripts, run in order:
 # 1. Setup environment (clone, venv, install deps)
 bash scripts/setup_env.sh
 
-# 2. Download & preprocess data (~200 tickers, 2004-2025)
+# 2. Download & preprocess data (popular tickers, hourly bars)
 bash scripts/prepare_data.sh
 
 # 3. Launch training
@@ -72,7 +72,7 @@ torchrun --standalone --nproc_per_node=4 pretrain_scaled.py \
 | File | Description |
 |------|-------------|
 | `scripts/setup_env.sh` | Clone repo, create venv, install deps |
-| `scripts/prepare_data.sh` | Download ~200 tickers daily OHLCV via yfinance |
+| `scripts/prepare_data.sh` | Download hourly history for popular tickers via yfinance |
 | `scripts/launch_training.sh` | Launch DDP training (single/multi-GPU/multi-node) |
 | `download_data.py` | Python data download script |
 | `pretrain_scaled.py` | Full DDP pretraining script (multi-node, multi-GPU, wandb) |
@@ -94,10 +94,13 @@ Uses the official Kronos-mini config from HuggingFace:
 
 ## Data
 
-`download_data.py` fetches daily OHLCV from ~200 diverse tickers:
-- US large/mid-cap across all sectors (tech, finance, healthcare, energy, etc.)
-- Sector & broad market ETFs (SPY, QQQ, XLF, EEM, etc.)
-- ~987K total rows, 2004-2025
+`download_data.py` now fetches hourly OHLCV from a curated set of liquid tickers:
+- `60m` bars from Yahoo Finance
+- full available hourly lookback per ticker, currently about `730d`
+- enough tickers to reach roughly `100,000` total rows by default
+- one CSV per ticker in `data/pretrain/`
+
+This keeps the corpus much smaller than the original broad multi-sector sweep while still using multiple popular names.
 
 ## Wandb
 
